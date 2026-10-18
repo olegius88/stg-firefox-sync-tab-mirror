@@ -1,0 +1,75 @@
+[
+  {
+    "namespace": "fxSyncBridge",
+    "description": "Privileged bridge for Firefox Sync (Weave extension-storage engine) and Simple Tab Groups background integration.",
+    "functions": [
+      {
+        "name": "getSyncAccountInfo",
+        "type": "function",
+        "async": true,
+        "parameters": []
+      },
+      {
+        "name": "triggerFirefoxSync",
+        "type": "function",
+        "async": true,
+        "parameters": []
+      },
+      {
+        "name": "getStgState",
+        "type": "function",
+        "async": true,
+        "parameters": []
+      },
+      {
+        "name": "ensureStgGroup",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {
+            "name": "title",
+            "type": "string"
+          }
+        ]
+      },
+      {
+        "name": "createMirroredTabInStg",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {
+            "name": "spec",
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
+      },
+      {
+        "name": "moveMirroredTabToStgGroup",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {
+            "name": "tabId",
+            "type": "integer"
+          },
+          {
+            "name": "groupId",
+            "type": "integer"
+          }
+        ]
+      },
+      {
+        "name": "removeMirroredTab",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {
+            "name": "tabId",
+            "type": "integer"
+          }
+        ]
+      }
+    ]
+  }
+]

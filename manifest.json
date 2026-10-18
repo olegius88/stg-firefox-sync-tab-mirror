@@ -1,0 +1,48 @@
+{
+  "manifest_version": 2,
+  "name": "STG Firefox Sync Tab Mirror",
+  "version": "1.0.0",
+  "description": "Зеркальная фоновая синхронизация открытых вкладок, групп Simple Tab Groups и нативных групп между браузерами через встроенный движок Firefox Sync.",
+  "author": "Oleg",
+  "homepage_url": "https://github.com/olegius88/stg-firefox-sync-tab-mirror",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "stg-tab-mirror-sync@olegius.org",
+      "strict_min_version": "128.0",
+      "update_url": "https://raw.githubusercontent.com/olegius88/stg-firefox-sync-tab-mirror/main/updates.json"
+    }
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "permissions": [
+    "tabs",
+    "tabHide",
+    "tabGroups",
+    "sessions",
+    "storage",
+    "contextualIdentities",
+    "cookies"
+  ],
+  "browser_action": {
+    "default_icon": "icons/icon.svg",
+    "default_title": "STG Firefox Sync Tab Mirror",
+    "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "experiment_apis": {
+    "fxSyncBridge": {
+      "schema": "experiments/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["fxSyncBridge"]],
+        "script": "experiments/api.js"
+      }
+    }
+  }
+}

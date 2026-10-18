@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>STG Firefox Sync Tab Mirror</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title-row">
+      <div class="logo-badge">SYNC</div>
+      <div>
+        <h1>Зеркало вкладок Firefox Sync</h1>
+        <p class="subtitle">Фоновая синхронизация STG и нативных групп</p>
+      </div>
+    </div>
+    <label class="switch" title="Включить / выключить зеркальную синхронизацию">
+      <input type="checkbox" id="mirrorEnabled">
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="account-box" id="accountBox">
+    <div class="account-row">
+      <span class="account-label">Аккаунт Firefox Sync:</span>
+      <span class="account-val" id="fxAccountVal">Проверка...</span>
+    </div>
+    <div class="account-row">
+      <span class="account-label">Текущее устройство:</span>
+      <span class="account-val" id="deviceNameVal">—</span>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <span class="stat-num" id="statTabsCount">0</span>
+      <span class="stat-label">Вкладок в зеркале</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-num" id="statGroupsCount">0</span>
+      <span class="stat-label">Групп STG</span>
+    </div>
+  </div>
+
+  <div class="status-line" id="statusLine">Загрузка состояния...</div>
+
+  <div class="section">
+    <h2>Параметры зеркалирования</h2>
+
+    <label class="option-row">
+      <input type="checkbox" id="syncCloseTabs">
+      <div>
+        <div class="option-title">Зеркалировать закрытие вкладок</div>
+        <div class="option-desc">Закрытие вкладки на одной машине закрывает её в фоне на других (закрытие всего окна браузера игнорируется)</div>
+      </div>
+    </label>
+
+    <label class="option-row">
+      <input type="checkbox" id="syncUrlChanges">
+      <div>
+        <div class="option-title">Зеркалировать смену URL внутри вкладки</div>
+        <div class="option-desc">При переходе по ссылке обновляет URL соответствующей фоновой вкладки</div>
+      </div>
+    </label>
+
+    <label class="option-row">
+      <input type="checkbox" id="syncMoveGroups">
+      <div>
+        <div class="option-title">Зеркалировать перемещение по группам</div>
+        <div class="option-desc">Синхронизирует перенос вкладок между группами STG и нативными группами Firefox</div>
+      </div>
+    </label>
+
+    <label class="option-row">
+      <input type="checkbox" id="syncPinnedTabs">
+      <div>
+        <div class="option-title">Синхронизировать закреплённые вкладки</div>
+        <div class="option-desc">Включать закреплённые (pinned) вкладки в общее зеркало</div>
+      </div>
+    </label>
+
+    <div class="interval-row">
+      <span>Интервал фонового опроса Firefox Sync (сек):</span>
+      <input type="number" id="pollIntervalSec" min="4" max="120" step="1" value="8">
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="btnSyncNow" class="btn primary">🔄 Синхронизировать сейчас</button>
+    <div class="actions-sub">
+      <button id="btnForcePush" class="btn secondary">⬆️ Отправить все</button>
+      <button id="btnForcePull" class="btn secondary">⬇️ Принять из облака</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

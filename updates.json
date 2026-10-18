@@ -1,0 +1,17 @@
+{
+  "addons": {
+    "stg-tab-mirror-sync@olegius.org": {
+      "updates": [
+        {
+          "version": "1.0.0",
+          "update_link": "https://raw.githubusercontent.com/olegius88/stg-firefox-sync-tab-mirror/main/stg-tab-mirror-sync.xpi",
+          "applications": {
+            "gecko": {
+              "strict_min_version": "128.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
