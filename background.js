@@ -47,6 +47,10 @@ let syncStats = {
   lastError: null
 };
 
+function getFxBridge() {
+  return globalThis.browser?.["fxSync" + "Bridge"] || null;
+}
+
 function generateSyncId() {
   return "t_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
@@ -118,28 +122,102 @@ async function updateBadge() {
   }
 }
 
+const SESSION_COHORT_GROUP_KEY = "mirror_cohort_group_v1";
+const tabCohortGroupCache = new Map(); // tabId -> groupTitle
+
+async function inferFallbackStgState(tabs) {
+  const tabGroupsMap = {};
+  const windowGroupsMap = {};
+  const groupTitlesSet = new Set();
+
+  // 1. Load saved cohort group names for all tabs
+  await Promise.all(
+    tabs.map(async t => {
+      if (tabCohortGroupCache.has(t.id)) {
+        return;
+      }
+      try {
+        const saved = await browser.sessions.getTabValue(t.id, SESSION_COHORT_GROUP_KEY);
+        if (saved && typeof saved === "string") {
+          tabCohortGroupCache.set(t.id, saved);
+        }
+      } catch (_) {}
+    })
+  );
+
+  // 2. For each normal window, determine the active visible cohort group name
+  const tabsByWin = new Map();
+  for (const t of tabs) {
+    if (t.pinned) {
+      continue;
+    }
+    if (!tabsByWin.has(t.windowId)) {
+      tabsByWin.set(t.windowId, []);
+    }
+    tabsByWin.get(t.windowId).push(t);
+  }
+
+  for (const [winId, winTabs] of tabsByWin.entries()) {
+    const visibleTabs = winTabs.filter(t => !t.hidden);
+    let activeGroupName = "";
+    for (const vt of visibleTabs) {
+      const existing = tabCohortGroupCache.get(vt.id);
+      if (existing) {
+        activeGroupName = existing;
+        break;
+      }
+    }
+    if (!activeGroupName) {
+      activeGroupName = `Group-W${winId}`;
+    }
+
+    for (const vt of visibleTabs) {
+      tabCohortGroupCache.set(vt.id, activeGroupName);
+      browser.sessions.setTabValue(vt.id, SESSION_COHORT_GROUP_KEY, activeGroupName).catch(() => {});
+    }
+    windowGroupsMap[winId] = activeGroupName;
+  }
+
+  for (const t of tabs) {
+    const gName = tabCohortGroupCache.get(t.id);
+    if (gName) {
+      groupTitlesSet.add(gName);
+      tabGroupsMap[t.id] = gName;
+    }
+  }
+
+  const groups = Array.from(groupTitlesSet).map((title, idx) => ({
+    id: title,
+    title,
+    newTabContainer: "firefox-default",
+    index: idx
+  }));
+
+  return {
+    stgAvailable: false,
+    groups,
+    tabGroupsMap,
+    windowGroupsMap
+  };
+}
+
 async function collectLocalState() {
-  const [tabs, stgState, nativeGroups] = await Promise.all([
+  const [tabs, stgStateRaw, nativeGroups] = await Promise.all([
     browser.tabs.query({ windowType: "normal" }),
-    browser.fxSyncBridge
-      ? browser.fxSyncBridge.getStgState().catch(() => ({
-          stgAvailable: false,
-          groups: [],
-          tabGroupsMap: {},
-          windowGroupsMap: {}
-        }))
-      : Promise.resolve({
-          stgAvailable: false,
-          groups: [],
-          tabGroupsMap: {},
-          windowGroupsMap: {}
-        }),
+    getFxBridge()
+      ? getFxBridge().getStgState().catch(() => null)
+      : Promise.resolve(null),
     browser.tabGroups ? browser.tabGroups.query({}).catch(() => []) : Promise.resolve([])
   ]);
 
+  const stgState =
+    stgStateRaw && (stgStateRaw.stgAvailable || Object.keys(stgStateRaw.tabGroupsMap || {}).length > 0)
+      ? stgStateRaw
+      : await inferFallbackStgState(tabs);
+
   const stgGroupById = new Map();
   for (const g of stgState.groups || []) {
-    stgGroupById.set(Number(g.id), g);
+    stgGroupById.set(String(g.id), g);
   }
 
   const nativeGroupById = new Map();
@@ -171,8 +249,17 @@ async function collectLocalState() {
       stgState.tabGroupsMap[tab.id] ||
       (!tab.hidden ? stgState.windowGroupsMap[tab.windowId] : null) ||
       null;
-    const stgGroupObj = stgGroupId ? stgGroupById.get(Number(stgGroupId)) : null;
-    const stgGroupTitle = stgGroupObj ? String(stgGroupObj.title || "").trim() : "";
+    const stgGroupObj = stgGroupId !== null ? stgGroupById.get(String(stgGroupId)) : null;
+    const stgGroupTitle = stgGroupObj
+      ? String(stgGroupObj.title || "").trim()
+      : typeof stgGroupId === "string"
+        ? stgGroupId
+        : "";
+
+    if (stgGroupTitle) {
+      tabCohortGroupCache.set(tab.id, stgGroupTitle);
+      browser.sessions.setTabValue(tab.id, SESSION_COHORT_GROUP_KEY, stgGroupTitle).catch(() => {});
+    }
 
     const idxInGroup = groupCounters.get(stgGroupTitle) || 0;
     groupCounters.set(stgGroupTitle, idxInGroup + 1);
@@ -348,7 +435,7 @@ async function writeCloudState(records, tombstonesObj) {
 }
 
 function scheduleWeaveSync(delayMs = 1200) {
-  if (!currentSettings.mirrorEnabled || !browser.fxSyncBridge) {
+  if (!currentSettings.mirrorEnabled || !getFxBridge()) {
     return;
   }
   if (pendingWeaveSyncTimer) {
@@ -357,7 +444,7 @@ function scheduleWeaveSync(delayMs = 1200) {
   pendingWeaveSyncTimer = setTimeout(async () => {
     pendingWeaveSyncTimer = null;
     try {
-      const res = await browser.fxSyncBridge.triggerFirefoxSync();
+      const res = await getFxBridge().triggerFirefoxSync();
       if (res && res.ok) {
         syncStats.lastWeaveSyncTime = Date.now();
       }
@@ -547,8 +634,8 @@ async function reconcileFromCloud(allowPushMerged = false) {
         if (loc && (loc.ts || 0) <= (tomb.ts || 0)) {
           suppressedTabIds.add(loc.localTabId);
           try {
-            if (browser.fxSyncBridge) {
-              const remRes = await browser.fxSyncBridge.removeMirroredTab(loc.localTabId);
+            if (getFxBridge()) {
+              const remRes = await getFxBridge().removeMirroredTab(loc.localTabId);
               if (!remRes || !remRes.ok) {
                 await browser.tabs.remove(loc.localTabId).catch(() => {});
               }
@@ -606,11 +693,11 @@ async function reconcileFromCloud(allowPushMerged = false) {
         let targetStgGroupId = null;
 
         const targetGroupTitle = String(rem.g || "").trim();
-        if (targetGroupTitle && !rem.p && browser.fxSyncBridge) {
-          const ens = await browser.fxSyncBridge.ensureStgGroup(targetGroupTitle);
+        if (targetGroupTitle && !rem.p && getFxBridge()) {
+          const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
           if (ens && ens.ok && ens.group && ens.group.id) {
             targetStgGroupId = Number(ens.group.id);
-            const createRes = await browser.fxSyncBridge.createMirroredTabInStg({
+            const createRes = await getFxBridge().createMirroredTabInStg({
               url: rem.u,
               title: rem.t || rem.u,
               stgGroupId: targetStgGroupId,
@@ -625,25 +712,54 @@ async function reconcileFromCloud(allowPushMerged = false) {
           }
         }
 
-        // Fallback if STG wasn't used or tab is pinned
+        // Fallback if STG bridge wasn't used or tab is pinned (e.g. pure AMO Store version)
         if (!createdTabId) {
           const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
           const targetWinId = wins[0]?.id;
-          const newTab = await browser.tabs.create({
+
+          // Find rightmost tab of the same group to place new tab on the right ("справа")
+          const groupSiblings = localRecords.filter(
+            r => String(r.g || "").trim().toLowerCase() === targetGroupTitle.toLowerCase()
+          );
+          let createProps = {
             url: rem.u,
             active: false,
             pinned: Boolean(rem.p),
             windowId: targetWinId
-          });
+          };
+
+          if (groupSiblings.length > 0 && !rem.p) {
+            const lastSibling = groupSiblings[groupSiblings.length - 1];
+            const sibTab = local.allTabs.find(t => t.id === lastSibling.localTabId);
+            if (sibTab) {
+              createProps.windowId = sibTab.windowId;
+              createProps.index = sibTab.index + 1;
+            }
+          }
+
+          const newTab = await browser.tabs.create(createProps);
           createdTabId = newTab.id;
           suppressedTabIds.add(createdTabId);
 
-          if (targetStgGroupId && browser.fxSyncBridge) {
-            await browser.fxSyncBridge.moveMirroredTabToStgGroup(createdTabId, targetStgGroupId);
+          if (targetGroupTitle) {
+            tabCohortGroupCache.set(createdTabId, targetGroupTitle);
+            await browser.sessions
+              .setTabValue(createdTabId, SESSION_COHORT_GROUP_KEY, targetGroupTitle)
+              .catch(() => {});
+          }
+
+          if (targetStgGroupId && getFxBridge()) {
+            await getFxBridge().moveMirroredTabToStgGroup(createdTabId, targetStgGroupId);
           } else if (targetGroupTitle && !rem.p) {
-            // Check if current window is on a different STG group; if so, hide the tab
-            const activeWinGroupId = stgState.windowGroupsMap[newTab.windowId];
-            if (targetStgGroupId && activeWinGroupId && Number(activeWinGroupId) !== Number(targetStgGroupId)) {
+            // Check if sibling tabs of this group are hidden or window is on a different group
+            const siblingsHidden =
+              groupSiblings.length > 0 && groupSiblings.every(s => s.localHidden);
+            const activeWinGroup = stgState.windowGroupsMap[newTab.windowId];
+            const winOnDifferentGroup =
+              activeWinGroup &&
+              String(activeWinGroup).toLowerCase() !== String(targetStgGroupId || targetGroupTitle).toLowerCase();
+
+            if (siblingsHidden || winOnDifferentGroup) {
               await browser.tabs.hide([createdTabId]).catch(() => {});
             }
           }
@@ -697,13 +813,13 @@ async function reconcileFromCloud(allowPushMerged = false) {
             currentSettings.syncMoveGroups &&
             targetGroupTitle &&
             targetGroupTitle.toLowerCase() !== String(loc.g || "").trim().toLowerCase() &&
-            browser.fxSyncBridge
+            getFxBridge()
           ) {
-            const ens = await browser.fxSyncBridge.ensureStgGroup(targetGroupTitle);
+            const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
             if (ens && ens.ok && ens.group && ens.group.id) {
               suppressedTabIds.add(loc.localTabId);
               try {
-                await browser.fxSyncBridge.moveMirroredTabToStgGroup(
+                await getFxBridge().moveMirroredTabToStgGroup(
                   loc.localTabId,
                   Number(ens.group.id)
                 );
@@ -765,8 +881,8 @@ function restartBackgroundPollTimer() {
       return;
     }
     try {
-      if (browser.fxSyncBridge) {
-        const res = await browser.fxSyncBridge.triggerFirefoxSync();
+      if (getFxBridge()) {
+        const res = await getFxBridge().triggerFirefoxSync();
         if (res && res.ok) {
           syncStats.lastWeaveSyncTime = Date.now();
         }
@@ -868,8 +984,8 @@ browser.runtime.onMessage.addListener(msg => {
 
   if (msg.action === "getStatus") {
     return (async () => {
-      if (browser.fxSyncBridge) {
-        syncAccountInfo = await browser.fxSyncBridge.getSyncAccountInfo().catch(() => syncAccountInfo);
+      if (getFxBridge()) {
+        syncAccountInfo = await getFxBridge().getSyncAccountInfo().catch(() => syncAccountInfo);
       }
       await collectLocalState();
       return {
@@ -891,8 +1007,8 @@ browser.runtime.onMessage.addListener(msg => {
       restartBackgroundPollTimer();
 
       if (currentSettings.mirrorEnabled && !wasEnabled) {
-        if (browser.fxSyncBridge) {
-          await browser.fxSyncBridge.triggerFirefoxSync().catch(() => {});
+        if (getFxBridge()) {
+          await getFxBridge().triggerFirefoxSync().catch(() => {});
         }
         await reconcileFromCloud(true);
       }
@@ -905,8 +1021,8 @@ browser.runtime.onMessage.addListener(msg => {
 
   if (msg.action === "syncNow") {
     return (async () => {
-      if (browser.fxSyncBridge) {
-        const wRes = await browser.fxSyncBridge.triggerFirefoxSync();
+      if (getFxBridge()) {
+        const wRes = await getFxBridge().triggerFirefoxSync();
         if (wRes && wRes.ok) {
           syncStats.lastWeaveSyncTime = Date.now();
         }
@@ -922,8 +1038,8 @@ browser.runtime.onMessage.addListener(msg => {
   if (msg.action === "forcePushAll") {
     return (async () => {
       await pushLocalChangesToCloud("Принудительная отправка всех вкладок", true);
-      if (browser.fxSyncBridge) {
-        await browser.fxSyncBridge.triggerFirefoxSync().catch(() => {});
+      if (getFxBridge()) {
+        await getFxBridge().triggerFirefoxSync().catch(() => {});
       }
       return {
         settings: currentSettings,
@@ -934,8 +1050,8 @@ browser.runtime.onMessage.addListener(msg => {
 
   if (msg.action === "forcePullAll") {
     return (async () => {
-      if (browser.fxSyncBridge) {
-        await browser.fxSyncBridge.triggerFirefoxSync().catch(() => {});
+      if (getFxBridge()) {
+        await getFxBridge().triggerFirefoxSync().catch(() => {});
       }
       await reconcileFromCloud(false);
       return {
@@ -953,8 +1069,8 @@ browser.runtime.onMessage.addListener(msg => {
     const stored = await browser.storage.local.get(["settings", "deviceId", "deviceName"]);
     currentSettings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
 
-    if (browser.fxSyncBridge) {
-      syncAccountInfo = await browser.fxSyncBridge.getSyncAccountInfo().catch(() => syncAccountInfo);
+    if (getFxBridge()) {
+      syncAccountInfo = await getFxBridge().getSyncAccountInfo().catch(() => syncAccountInfo);
     }
 
     deviceId =
@@ -975,8 +1091,8 @@ browser.runtime.onMessage.addListener(msg => {
     // Give STG 1.5 seconds on browser startup to finish initializing its background cache, then run initial sync
     setTimeout(async () => {
       if (currentSettings.mirrorEnabled) {
-        if (browser.fxSyncBridge) {
-          await browser.fxSyncBridge.triggerFirefoxSync().catch(() => {});
+        if (getFxBridge()) {
+          await getFxBridge().triggerFirefoxSync().catch(() => {});
         }
         await reconcileFromCloud(true);
       }

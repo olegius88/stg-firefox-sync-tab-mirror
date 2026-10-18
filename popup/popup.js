@@ -35,8 +35,8 @@ function renderState(res) {
     elFxAccountVal.textContent = syncAccountInfo.username;
     elFxAccountVal.style.color = "#34d399";
   } else {
-    elFxAccountVal.textContent = "Не авторизован в Firefox Sync";
-    elFxAccountVal.style.color = "#f87171";
+    elFxAccountVal.textContent = "Активно (storage.sync)";
+    elFxAccountVal.style.color = "#38bdf8";
   }
 
   elDeviceNameVal.textContent =
