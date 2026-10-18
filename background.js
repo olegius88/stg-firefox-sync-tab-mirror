@@ -10,11 +10,17 @@ const DEFAULT_SETTINGS = {
 };
 
 const SESSION_SYNC_ID_KEY = "mirror_sync_tab_id_v1";
+const SESSION_COHORT_GROUP_KEY = "mirror_cohort_group_v1";
 const META_KEY = "mirror_meta_v1";
 const CHUNK_PREFIX = "mirror_chunk_v1_";
 const MAX_CHUNK_BYTES = 5800; // Safe margin below 8192 bytes per item in storage.sync
 const MAX_TOMBSTONES = 120;
 const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const GIT_BASE_KEY = "git_base_commit_v2";
+const GIT_LOG_KEY = "git_commit_log_v2";
+const GIT_CONFLICTS_KEY = "git_active_conflicts_v2";
+const MAX_LOCAL_COMMITS = 25;
 
 let currentSettings = { ...DEFAULT_SETTINGS };
 let deviceId = "";
@@ -25,25 +31,39 @@ let syncAccountInfo = { enabled: false, username: "", clientName: "" };
 const tabIdToSyncId = new Map();
 const syncIdToTabId = new Map();
 const localTabTimestamps = new Map(); // syncTabId -> updatedAt (ms)
-const knownTabSnapshot = new Map(); // tabId -> { syncTabId, url, stgGroupTitle }
-const pendingTombstones = new Map(); // syncTabId -> { ts, by, u, g }
+const knownTabSnapshot = new Map(); // tabId -> { syncTabId, url, stgGroupTitle, nativeGroupTitle, indexInGroup }
+const tabCohortGroupCache = new Map(); // tabId -> groupTitle
+const locallyClosedSinceBase = new Map(); // syncTabId -> { ts, by, u, g, t }
+
+// Git state: BASE commit, commit history log, and active conflicts
+let baseCommit = {
+  commitId: "",
+  parentId: "",
+  timestamp: 0,
+  recordsMap: {} // syncTabId -> wireRecord
+};
+let commitLog = []; // Array of { commitId, parentId, timestamp, authorId, authorName, message, stats: { added, modified, deleted, total }, records: [...] }
+let activeConflicts = {}; // syncTabId -> { id, type, detectedAt, base, local, remote, remoteDeviceName }
 
 // Guards to prevent echo loops
 const suppressedTabIds = new Set();
-let isReconciling = false;
-let isPushing = false;
-let pendingPushTimer = null;
+let isSyncingGit = false;
+let pendingGitSyncTimer = null;
 let pendingWeaveSyncTimer = null;
 let pollIntervalHandle = null;
 
 // Stats for Popup UI
 let syncStats = {
+  headCommitId: "",
+  parentCommitId: "",
   lastPushTime: 0,
   lastPullTime: 0,
   lastWeaveSyncTime: 0,
   totalSyncedTabs: 0,
   totalStgGroups: 0,
-  lastActionText: "Инициализация...",
+  conflictCount: 0,
+  lastDiffStats: { added: 0, modified: 0, deleted: 0 },
+  lastActionText: "Инициализация Git-движка...",
   lastError: null
 };
 
@@ -55,11 +75,41 @@ function generateSyncId() {
   return "t_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
 
+function fnv1aHex(str) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function generateCommitId(records, parentId = "") {
+  const payload =
+    (parentId || "root") +
+    "|" +
+    Date.now().toString(36) +
+    "|" +
+    records.map(r => `${r.id}:${r.u}:${r.g}:${r.ng || ""}`).join(";");
+  return "c_" + fnv1aHex(payload).slice(0, 7);
+}
+
+function shortCommitHash(commitId) {
+  if (!commitId) {
+    return "root";
+  }
+  return commitId.replace(/^c_/, "#");
+}
+
 function normalizeUrl(url) {
   if (!url || typeof url !== "string") {
     return "";
   }
   return url.trim();
+}
+
+function normalizeGroup(groupTitle) {
+  return String(groupTitle || "").trim();
 }
 
 function isSyncableUrl(url) {
@@ -77,6 +127,54 @@ function isSyncableUrl(url) {
     return false;
   }
   return true;
+}
+
+function toWireRecord(r, now = Date.now()) {
+  return {
+    id: r.id,
+    u: String(r.u || "").slice(0, 600),
+    t: String(r.t || r.u || "").slice(0, 80),
+    g: String(r.g || "").slice(0, 80),
+    i: Number(r.i) || 0,
+    p: r.p ? 1 : 0,
+    ng: String(r.ng || "").slice(0, 60),
+    nc: String(r.nc || ""),
+    ts: Number(r.ts) || now,
+    by: r.by || deviceId
+  };
+}
+
+function recordsMapFromArray(records) {
+  const map = {};
+  for (const r of records || []) {
+    if (r && r.id) {
+      map[r.id] = toWireRecord(r);
+    }
+  }
+  return map;
+}
+
+async function saveGitLocalState() {
+  syncStats.conflictCount = Object.keys(activeConflicts).length;
+  syncStats.headCommitId = baseCommit.commitId || "";
+  syncStats.parentCommitId = baseCommit.parentId || "";
+  await browser.storage.local.set({
+    [GIT_BASE_KEY]: baseCommit,
+    [GIT_LOG_KEY]: commitLog.slice(0, MAX_LOCAL_COMMITS),
+    [GIT_CONFLICTS_KEY]: activeConflicts
+  });
+}
+
+async function appendCommitToLog(commitEntry) {
+  // Avoid duplicate commitId at head
+  if (commitLog.length > 0 && commitLog[0].commitId === commitEntry.commitId) {
+    return;
+  }
+  commitLog.unshift(commitEntry);
+  if (commitLog.length > MAX_LOCAL_COMMITS) {
+    commitLog = commitLog.slice(0, MAX_LOCAL_COMMITS);
+  }
+  await saveGitLocalState();
 }
 
 async function getOrAssignSyncId(tabId) {
@@ -110,27 +208,29 @@ async function setTabSyncId(tabId, syncId) {
 }
 
 async function updateBadge() {
+  const conflictCount = Object.keys(activeConflicts).length;
+  syncStats.conflictCount = conflictCount;
+
   if (!currentSettings.mirrorEnabled) {
     await browser.browserAction.setBadgeText({ text: "OFF" });
     await browser.browserAction.setBadgeBackgroundColor({ color: "#64748b" });
+  } else if (conflictCount > 0) {
+    await browser.browserAction.setBadgeText({ text: `⚡${conflictCount}` });
+    await browser.browserAction.setBadgeBackgroundColor({ color: "#f59e0b" });
   } else if (syncStats.lastError) {
     await browser.browserAction.setBadgeText({ text: "!" });
     await browser.browserAction.setBadgeBackgroundColor({ color: "#ef4444" });
   } else {
-    await browser.browserAction.setBadgeText({ text: "ON" });
+    await browser.browserAction.setBadgeText({ text: "GIT" });
     await browser.browserAction.setBadgeBackgroundColor({ color: "#10b981" });
   }
 }
-
-const SESSION_COHORT_GROUP_KEY = "mirror_cohort_group_v1";
-const tabCohortGroupCache = new Map(); // tabId -> groupTitle
 
 async function inferFallbackStgState(tabs) {
   const tabGroupsMap = {};
   const windowGroupsMap = {};
   const groupTitlesSet = new Set();
 
-  // 1. Load saved cohort group names for all tabs
   await Promise.all(
     tabs.map(async t => {
       if (tabCohortGroupCache.has(t.id)) {
@@ -145,7 +245,6 @@ async function inferFallbackStgState(tabs) {
     })
   );
 
-  // 2. For each normal window, determine the active visible cohort group name
   const tabsByWin = new Map();
   for (const t of tabs) {
     if (t.pinned) {
@@ -227,9 +326,8 @@ async function collectLocalState() {
 
   syncStats.totalStgGroups = stgGroupById.size;
 
-  // Sort tabs by windowId and index so relative order inside each STG group ("справа") is preserved
   const sortedTabs = tabs.slice().sort((a, b) => a.windowId - b.windowId || a.index - b.index);
-  const groupCounters = new Map(); // stgGroupTitle -> count
+  const groupCounters = new Map();
 
   const localRecords = [];
   for (const tab of sortedTabs) {
@@ -297,6 +395,9 @@ async function collectLocalState() {
       indexInGroup: idxInGroup
     });
 
+    // If tab is alive locally, ensure it's not in locallyClosedSinceBase
+    locallyClosedSinceBase.delete(syncId);
+
     localRecords.push({
       id: syncId,
       u: url.slice(0, 600),
@@ -354,8 +455,7 @@ async function readCloudState() {
   };
 }
 
-async function writeCloudState(records, tombstonesObj) {
-  // Prune old tombstones
+async function writeCloudCommit(records, tombstonesObj, commitMeta = {}) {
   const now = Date.now();
   const entries = Object.entries(tombstonesObj || {})
     .filter(([, val]) => val && now - (val.ts || 0) < TOMBSTONE_TTL_MS)
@@ -364,24 +464,14 @@ async function writeCloudState(records, tombstonesObj) {
 
   const cleanTombstones = Object.fromEntries(entries);
 
-  // Split records into chunks under MAX_CHUNK_BYTES
   const chunks = [];
   let currentChunk = [];
   let currentBytes = 2;
+  const wireRecords = [];
 
   for (const r of records) {
-    const wireRecord = {
-      id: r.id,
-      u: r.u,
-      t: r.t,
-      g: r.g,
-      i: r.i,
-      p: r.p ? 1 : 0,
-      ng: r.ng || "",
-      nc: r.nc || "",
-      ts: r.ts || now,
-      by: r.by || deviceId
-    };
+    const wireRecord = toWireRecord(r, now);
+    wireRecords.push(wireRecord);
     const serialized = JSON.stringify(wireRecord);
     const byteLen = new TextEncoder().encode(serialized).length + 2;
 
@@ -400,14 +490,23 @@ async function writeCloudState(records, tombstonesObj) {
   const existingSync = await browser.storage.sync.get(META_KEY);
   const oldChunkCount = Number(existingSync[META_KEY]?.chunkCount) || 0;
 
+  const parentId = commitMeta.parentId || baseCommit.commitId || existingSync[META_KEY]?.commitId || "";
+  const commitId = commitMeta.commitId || generateCommitId(wireRecords, parentId);
+  const message = commitMeta.message || "Синхронизация вкладок";
+  const stats = commitMeta.stats || { added: 0, modified: 0, deleted: 0, total: wireRecords.length };
+
   const payload = {
     [META_KEY]: {
-      version: 1,
+      version: 2,
+      commitId,
+      parentId,
+      message: String(message).slice(0, 120),
+      stats,
       updatedAt: now,
       updatedBy: deviceId,
       updatedByName: deviceName,
       chunkCount: chunks.length,
-      totalTabs: records.length,
+      totalTabs: wireRecords.length,
       tombstones: cleanTombstones
     }
   };
@@ -418,7 +517,6 @@ async function writeCloudState(records, tombstonesObj) {
 
   await browser.storage.sync.set(payload);
 
-  // Clean up any leftover old chunks
   if (oldChunkCount > chunks.length) {
     const keysToRemove = [];
     for (let i = chunks.length; i < oldChunkCount; i++) {
@@ -430,8 +528,18 @@ async function writeCloudState(records, tombstonesObj) {
   }
 
   syncStats.lastPushTime = now;
-  syncStats.totalSyncedTabs = records.length;
+  syncStats.totalSyncedTabs = wireRecords.length;
   scheduleWeaveSync();
+
+  return {
+    commitId,
+    parentId,
+    timestamp: now,
+    message,
+    stats,
+    wireRecords,
+    cleanTombstones
+  };
 }
 
 function scheduleWeaveSync(delayMs = 1200) {
@@ -454,77 +562,7 @@ function scheduleWeaveSync(delayMs = 1200) {
   }, delayMs);
 }
 
-let lastPushedFingerprint = "";
-
-function computeStateFingerprint(records, tombstonesObj) {
-  const recPart = records
-    .map(r => `${r.id}|${r.u}|${r.g}|${r.i}|${r.p ? 1 : 0}|${r.ng || ""}|${r.nc || ""}`)
-    .join(";;");
-  const tombPart = Object.keys(tombstonesObj || {})
-    .sort()
-    .map(k => `${k}:${tombstonesObj[k]?.ts || 0}`)
-    .join(",");
-  return `${recPart}###${tombPart}`;
-}
-
-function schedulePushLocalChanges(reason = "Изменение вкладок", delayMs = 450, force = false) {
-  if (!currentSettings.mirrorEnabled || isReconciling) {
-    return;
-  }
-  if (pendingPushTimer) {
-    clearTimeout(pendingPushTimer);
-  }
-  pendingPushTimer = setTimeout(() => {
-    pendingPushTimer = null;
-    pushLocalChangesToCloud(reason, force);
-  }, delayMs);
-}
-
-async function pushLocalChangesToCloud(reason = "Синхронизация", force = false) {
-  if (!currentSettings.mirrorEnabled || isReconciling || isPushing) {
-    return;
-  }
-  isPushing = true;
-  try {
-    const [{ localRecords }, cloud] = await Promise.all([
-      collectLocalState(),
-      readCloudState()
-    ]);
-
-    const mergedTombstones = { ...(cloud.tombstones || {}) };
-    let addedNewTombstone = false;
-    for (const [syncId, tomb] of pendingTombstones.entries()) {
-      mergedTombstones[syncId] = tomb;
-      addedNewTombstone = true;
-    }
-    pendingTombstones.clear();
-
-    // Remove any tombstone if the tab is currently alive locally with a newer timestamp
-    for (const rec of localRecords) {
-      const tomb = mergedTombstones[rec.id];
-      if (tomb && rec.ts > tomb.ts) {
-        delete mergedTombstones[rec.id];
-      }
-    }
-
-    const fingerprint = computeStateFingerprint(localRecords, mergedTombstones);
-    if (!force && !addedNewTombstone && fingerprint === lastPushedFingerprint && cloud.meta) {
-      return;
-    }
-
-    await writeCloudState(localRecords, mergedTombstones);
-    lastPushedFingerprint = fingerprint;
-    syncStats.lastActionText = `Отправлено (${localRecords.length} вкл.): ${reason}`;
-    syncStats.lastError = null;
-    await updateBadge();
-  } catch (err) {
-    console.error("[STG Mirror Sync] pushLocalChangesToCloud error:", err);
-    syncStats.lastError = String(err && err.message ? err.message : err);
-    await updateBadge();
-  } finally {
-    isPushing = false;
-  }
-}
+// === Browser DOM / Tab manipulation helpers (strictly background!) ===
 
 async function ensureNativeTabGroupOnTab(tabId, windowId, nativeGroupTitle, nativeGroupColor) {
   if (!browser.tabGroups) {
@@ -549,7 +587,6 @@ async function ensureNativeTabGroupOnTab(tabId, windowId, nativeGroupTitle, nati
       return;
     }
 
-    // Check if already in a native group with this title
     if (currentGroupId !== TAB_GROUP_ID_NONE) {
       try {
         const curNg = await browser.tabGroups.get(currentGroupId);
@@ -559,7 +596,6 @@ async function ensureNativeTabGroupOnTab(tabId, windowId, nativeGroupTitle, nati
       } catch (_) {}
     }
 
-    // Look for an existing native group in the same window with this title
     const groupsInWin = await browser.tabGroups.query({ windowId: tab.windowId });
     const matchNg = groupsInWin.find(
       g => String(g.title || "").trim().toLowerCase() === cleanTitle.toLowerCase()
@@ -587,79 +623,308 @@ async function ensureNativeTabGroupOnTab(tabId, windowId, nativeGroupTitle, nati
   }
 }
 
-async function reconcileFromCloud(allowPushMerged = false) {
-  if (!currentSettings.mirrorEnabled || isReconciling) {
+async function createTabInBackgroundFromRecord(rem, localContext) {
+  let createdTabId = null;
+  let targetStgGroupId = null;
+  const targetGroupTitle = normalizeGroup(rem.g);
+
+  if (targetGroupTitle && !rem.p && getFxBridge()) {
+    const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
+    if (ens && ens.ok && ens.group && ens.group.id) {
+      targetStgGroupId = Number(ens.group.id);
+      const createRes = await getFxBridge().createMirroredTabInStg({
+        url: rem.u,
+        title: rem.t || rem.u,
+        stgGroupId: targetStgGroupId,
+        cookieStoreId: ens.group.newTabContainer || "firefox-default",
+        indexInGroup: rem.i
+      });
+
+      if (createRes && createRes.ok && createRes.tabId) {
+        createdTabId = createRes.tabId;
+        suppressedTabIds.add(createdTabId);
+      }
+    }
+  }
+
+  if (!createdTabId) {
+    const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
+    const targetWinId = wins[0]?.id;
+
+    const groupSiblings = localContext.localRecords.filter(
+      r => normalizeGroup(r.g).toLowerCase() === targetGroupTitle.toLowerCase()
+    );
+    const createProps = {
+      url: rem.u,
+      active: false,
+      pinned: Boolean(rem.p),
+      windowId: targetWinId
+    };
+
+    if (groupSiblings.length > 0 && !rem.p) {
+      const lastSibling = groupSiblings[groupSiblings.length - 1];
+      const sibTab = localContext.allTabs.find(t => t.id === lastSibling.localTabId);
+      if (sibTab) {
+        createProps.windowId = sibTab.windowId;
+        createProps.index = sibTab.index + 1;
+      }
+    }
+
+    const newTab = await browser.tabs.create(createProps);
+    createdTabId = newTab.id;
+    suppressedTabIds.add(createdTabId);
+
+    if (targetGroupTitle) {
+      tabCohortGroupCache.set(createdTabId, targetGroupTitle);
+      await browser.sessions
+        .setTabValue(createdTabId, SESSION_COHORT_GROUP_KEY, targetGroupTitle)
+        .catch(() => {});
+    }
+
+    if (targetStgGroupId && getFxBridge()) {
+      await getFxBridge().moveMirroredTabToStgGroup(createdTabId, targetStgGroupId);
+    } else if (targetGroupTitle && !rem.p) {
+      const siblingsHidden =
+        groupSiblings.length > 0 && groupSiblings.every(s => s.localHidden);
+      const activeWinGroup = localContext.stgState.windowGroupsMap[newTab.windowId];
+      const winOnDifferentGroup =
+        activeWinGroup &&
+        String(activeWinGroup).toLowerCase() !== String(targetStgGroupId || targetGroupTitle).toLowerCase();
+
+      if (siblingsHidden || winOnDifferentGroup) {
+        await browser.tabs.hide([createdTabId]).catch(() => {});
+      }
+    }
+  }
+
+  if (createdTabId) {
+    await setTabSyncId(createdTabId, rem.id);
+    localTabTimestamps.set(rem.id, rem.ts || Date.now());
+    knownTabSnapshot.set(createdTabId, {
+      syncTabId: rem.id,
+      url: normalizeUrl(rem.u),
+      title: rem.t || "",
+      stgGroupTitle: targetGroupTitle,
+      nativeGroupTitle: rem.ng || "",
+      indexInGroup: rem.i || 0
+    });
+
+    if (rem.ng) {
+      await ensureNativeTabGroupOnTab(createdTabId, null, rem.ng, rem.nc);
+    }
+
+    setTimeout(() => suppressedTabIds.delete(createdTabId), 800);
+  }
+
+  return createdTabId;
+}
+
+async function applyRecordUpdateToLocalTab(loc, targetRecord) {
+  let changed = false;
+  const targetGroupTitle = normalizeGroup(targetRecord.g);
+
+  // 1. URL update
+  if (
+    currentSettings.syncUrlChanges &&
+    normalizeUrl(targetRecord.u) !== normalizeUrl(loc.u)
+  ) {
+    suppressedTabIds.add(loc.localTabId);
+    try {
+      await browser.tabs.update(loc.localTabId, { url: targetRecord.u });
+      changed = true;
+    } catch (_) {
+    } finally {
+      setTimeout(() => suppressedTabIds.delete(loc.localTabId), 600);
+    }
+  }
+
+  // 2. STG group move
+  if (
+    currentSettings.syncMoveGroups &&
+    targetGroupTitle &&
+    targetGroupTitle.toLowerCase() !== normalizeGroup(loc.g).toLowerCase()
+  ) {
+    tabCohortGroupCache.set(loc.localTabId, targetGroupTitle);
+    await browser.sessions
+      .setTabValue(loc.localTabId, SESSION_COHORT_GROUP_KEY, targetGroupTitle)
+      .catch(() => {});
+
+    if (getFxBridge()) {
+      const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
+      if (ens && ens.ok && ens.group && ens.group.id) {
+        suppressedTabIds.add(loc.localTabId);
+        try {
+          await getFxBridge().moveMirroredTabToStgGroup(
+            loc.localTabId,
+            Number(ens.group.id)
+          );
+          changed = true;
+        } finally {
+          setTimeout(() => suppressedTabIds.delete(loc.localTabId), 600);
+        }
+      }
+    }
+  }
+
+  // 3. Native Firefox Tab Group move
+  if (
+    currentSettings.syncMoveGroups &&
+    String(targetRecord.ng || "") !== String(loc.ng || "")
+  ) {
+    await ensureNativeTabGroupOnTab(
+      loc.localTabId,
+      loc.localWindowId,
+      targetRecord.ng,
+      targetRecord.nc
+    );
+    changed = true;
+  }
+
+  localTabTimestamps.set(loc.id, targetRecord.ts || Date.now());
+  return changed;
+}
+
+async function closeLocalTabForSync(localTabId, syncId) {
+  suppressedTabIds.add(localTabId);
+  try {
+    if (getFxBridge()) {
+      const remRes = await getFxBridge().removeMirroredTab(localTabId);
+      if (!remRes || !remRes.ok) {
+        await browser.tabs.remove(localTabId).catch(() => {});
+      }
+    } else {
+      await browser.tabs.remove(localTabId).catch(() => {});
+    }
+    tabIdToSyncId.delete(localTabId);
+    if (syncId) {
+      syncIdToTabId.delete(syncId);
+      locallyClosedSinceBase.delete(syncId);
+    }
+    knownTabSnapshot.delete(localTabId);
+  } finally {
+    setTimeout(() => suppressedTabIds.delete(localTabId), 500);
+  }
+}
+
+// === Git 3-Way Merge Engine (BASE + LOCAL + REMOTE) ===
+
+function isSameUrl(a, b) {
+  return normalizeUrl(a) === normalizeUrl(b);
+}
+
+function isSameGroup(a, b) {
+  return normalizeGroup(a).toLowerCase() === normalizeGroup(b).toLowerCase();
+}
+
+function isSameNativeGroup(a, b) {
+  return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+}
+
+function isRecordEqualToBase(rec, base) {
+  if (!rec && !base) return true;
+  if (!rec || !base) return false;
+  return (
+    isSameUrl(rec.u, base.u) &&
+    isSameGroup(rec.g, base.g) &&
+    isSameNativeGroup(rec.ng, base.ng) &&
+    Boolean(rec.p) === Boolean(base.p)
+  );
+}
+
+function scheduleGitSync(reason = "Изменение вкладок", delayMs = 450) {
+  if (!currentSettings.mirrorEnabled || isSyncingGit) {
     return;
   }
-  isReconciling = true;
+  if (pendingGitSyncTimer) {
+    clearTimeout(pendingGitSyncTimer);
+  }
+  pendingGitSyncTimer = setTimeout(() => {
+    pendingGitSyncTimer = null;
+    runGitThreeWaySync({ reason, allowPush: true });
+  }, delayMs);
+}
+
+async function runGitThreeWaySync(options = {}) {
+  const { reason = "Git Sync", allowPush = true } = options;
+  if (!currentSettings.mirrorEnabled || isSyncingGit) {
+    return;
+  }
+  isSyncingGit = true;
 
   try {
-    const [cloud, local] = await Promise.all([
+    const [cloud, localContext] = await Promise.all([
       readCloudState(),
       collectLocalState()
     ]);
 
+    const { localRecords } = localContext;
+
+    // Case 0: Cloud is completely empty -> Initial commit from this machine
     if (!cloud.meta) {
-      // Nothing in cloud yet — push our initial state if requested
-      if (allowPushMerged && local.localRecords.length > 0) {
-        isReconciling = false;
-        await pushLocalChangesToCloud("Начальная выгрузка вкладок");
-        return;
+      if (allowPush && localRecords.length > 0) {
+        const commitRes = await writeCloudCommit(localRecords, {}, {
+          parentId: "root",
+          message: `Initial commit (${localRecords.length} вкл.)`,
+          stats: { added: localRecords.length, modified: 0, deleted: 0, total: localRecords.length }
+        });
+        baseCommit = {
+          commitId: commitRes.commitId,
+          parentId: "root",
+          timestamp: commitRes.timestamp,
+          recordsMap: recordsMapFromArray(commitRes.wireRecords)
+        };
+        await appendCommitToLog({
+          commitId: commitRes.commitId,
+          parentId: "root",
+          timestamp: commitRes.timestamp,
+          authorId: deviceId,
+          authorName: deviceName,
+          message: commitRes.message,
+          stats: commitRes.stats,
+          records: commitRes.wireRecords
+        });
+        syncStats.lastActionText = `Коммит ${shortCommitHash(commitRes.commitId)}: ${commitRes.message}`;
+        syncStats.lastError = null;
+        await updateBadge();
       }
       return;
     }
 
-    const { localRecords, stgState } = local;
+    // Record incoming remote commit in log if we haven't seen it yet
+    if (
+      cloud.meta.commitId &&
+      (!commitLog.length || !commitLog.some(c => c.commitId === cloud.meta.commitId))
+    ) {
+      await appendCommitToLog({
+        commitId: cloud.meta.commitId,
+        parentId: cloud.meta.parentId || "",
+        timestamp: cloud.meta.updatedAt || Date.now(),
+        authorId: cloud.meta.updatedBy || "",
+        authorName: cloud.meta.updatedByName || "Другой Firefox",
+        message: cloud.meta.message || `Синхронизация (${cloud.records.length} вкл.)`,
+        stats: cloud.meta.stats || { added: 0, modified: 0, deleted: 0, total: cloud.records.length },
+        records: cloud.records.map(r => toWireRecord(r))
+      });
+    }
+
+    // Build maps for LOCAL, REMOTE, and BASE
     const localBySyncId = new Map();
     const unlinkedLocalByGroupAndUrl = new Map();
-
     for (const r of localRecords) {
       localBySyncId.set(r.id, r);
-      const key = `${r.g.toLowerCase()}|||${r.u}`;
+      const key = `${normalizeGroup(r.g).toLowerCase()}|||${normalizeUrl(r.u)}`;
       if (!unlinkedLocalByGroupAndUrl.has(key)) {
         unlinkedLocalByGroupAndUrl.set(key, []);
       }
       unlinkedLocalByGroupAndUrl.get(key).push(r);
     }
 
-    let changesApplied = 0;
-
-    // 1. Handle remote tombstones (closed tabs on another mirrored browser)
-    if (currentSettings.syncCloseTabs && cloud.tombstones) {
-      for (const [syncId, tomb] of Object.entries(cloud.tombstones)) {
-        if (!tomb || tomb.by === deviceId) {
-          continue;
-        }
-        const loc = localBySyncId.get(syncId);
-        if (loc && (loc.ts || 0) <= (tomb.ts || 0)) {
-          suppressedTabIds.add(loc.localTabId);
-          try {
-            if (getFxBridge()) {
-              const remRes = await getFxBridge().removeMirroredTab(loc.localTabId);
-              if (!remRes || !remRes.ok) {
-                await browser.tabs.remove(loc.localTabId).catch(() => {});
-              }
-            } else {
-              await browser.tabs.remove(loc.localTabId).catch(() => {});
-            }
-            localBySyncId.delete(syncId);
-            tabIdToSyncId.delete(loc.localTabId);
-            syncIdToTabId.delete(syncId);
-            knownTabSnapshot.delete(loc.localTabId);
-            changesApplied++;
-          } finally {
-            setTimeout(() => suppressedTabIds.delete(loc.localTabId), 500);
-          }
-        }
-      }
-    }
-
-    // 2. Sort remote records by (groupTitle, indexInGroup) so new tabs in a group are added in left-to-right order ("справа")
+    // Smart deduplication before 3-way merge: link any local tab that matches a remote (group, url)
+    // and isn't already linked to another remote record
+    const remoteBySyncId = new Map();
     const sortedRemote = cloud.records
       .slice()
-      .sort((a, b) => String(a.g || "").localeCompare(String(b.g || "")) || (a.i || 0) - (b.i || 0));
-
-    const remoteSyncIds = new Set();
+      .sort((a, b) => normalizeGroup(a.g).localeCompare(normalizeGroup(b.g)) || (a.i || 0) - (b.i || 0));
 
     for (const rem of sortedRemote) {
       if (!rem || !rem.id || !isSyncableUrl(rem.u)) {
@@ -669,201 +934,589 @@ async function reconcileFromCloud(allowPushMerged = false) {
       if (tomb && (tomb.ts || 0) >= (rem.ts || 0)) {
         continue;
       }
+      remoteBySyncId.set(rem.id, rem);
 
-      remoteSyncIds.add(rem.id);
-
-      let loc = localBySyncId.get(rem.id);
-
-      // Smart deduplication: if we don't have rem.id yet, check if we already have an identical (group, url) tab locally
-      if (!loc) {
-        const matchKey = `${String(rem.g || "").trim().toLowerCase()}|||${normalizeUrl(rem.u)}`;
+      if (!localBySyncId.has(rem.id)) {
+        const matchKey = `${normalizeGroup(rem.g).toLowerCase()}|||${normalizeUrl(rem.u)}`;
         const candidates = unlinkedLocalByGroupAndUrl.get(matchKey);
         if (candidates && candidates.length > 0) {
           const matchedCandidate = candidates.shift();
+          const oldLocalId = matchedCandidate.id;
+          localBySyncId.delete(oldLocalId);
+          matchedCandidate.id = rem.id;
           await setTabSyncId(matchedCandidate.localTabId, rem.id);
           localTabTimestamps.set(rem.id, Math.max(matchedCandidate.ts || 0, rem.ts || 0));
           localBySyncId.set(rem.id, matchedCandidate);
-          loc = matchedCandidate;
+          // Also seed BASE if this is our first time linking this tab
+          if (!baseCommit.recordsMap[rem.id]) {
+            baseCommit.recordsMap[rem.id] = toWireRecord(rem);
+          }
         }
       }
+    }
 
-      if (!loc) {
-        // NEW TAB FROM ANOTHER BROWSER -> Create strictly in background (inactive, and hidden if in another STG group!)
-        let createdTabId = null;
-        let targetStgGroupId = null;
+    const baseMap = baseCommit.recordsMap || {};
+    const nextBaseMap = { ...baseMap };
+    const mergedRecordsMap = new Map();
+    const mergedTombstones = { ...(cloud.tombstones || {}) };
 
-        const targetGroupTitle = String(rem.g || "").trim();
-        if (targetGroupTitle && !rem.p && getFxBridge()) {
-          const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
-          if (ens && ens.ok && ens.group && ens.group.id) {
-            targetStgGroupId = Number(ens.group.id);
-            const createRes = await getFxBridge().createMirroredTabInStg({
-              url: rem.u,
-              title: rem.t || rem.u,
-              stgGroupId: targetStgGroupId,
-              cookieStoreId: ens.group.newTabContainer || "firefox-default",
-              indexInGroup: rem.i
-            });
+    // Collect all candidate syncTabIds across BASE, LOCAL, REMOTE, and locallyClosedSinceBase
+    const allIds = new Set([
+      ...Object.keys(baseMap),
+      ...localBySyncId.keys(),
+      ...remoteBySyncId.keys(),
+      ...locallyClosedSinceBase.keys()
+    ]);
 
-            if (createRes && createRes.ok && createRes.tabId) {
-              createdTabId = createRes.tabId;
-              suppressedTabIds.add(createdTabId);
-            }
-          }
+    let appliedRemoteChanges = 0;
+    let hasLocalDirtyToPush = false;
+    let diffAdded = 0;
+    let diffModified = 0;
+    let diffDeleted = 0;
+
+    for (const syncId of allIds) {
+      // If there is already an unresolved conflict for this syncId, preserve conflict state and keep local tab intact
+      if (activeConflicts[syncId]) {
+        const curLoc = localBySyncId.get(syncId);
+        const curRem = remoteBySyncId.get(syncId) || null;
+        activeConflicts[syncId].local = curLoc ? toWireRecord(curLoc) : null;
+        activeConflicts[syncId].remote = curRem ? toWireRecord(curRem) : null;
+        if (curLoc) {
+          mergedRecordsMap.set(syncId, toWireRecord(curLoc));
+        } else if (baseMap[syncId]) {
+          mergedRecordsMap.set(syncId, toWireRecord(baseMap[syncId]));
         }
+        continue;
+      }
 
-        // Fallback if STG bridge wasn't used or tab is pinned (e.g. pure AMO Store version)
-        if (!createdTabId) {
-          const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
-          const targetWinId = wins[0]?.id;
+      const B = baseMap[syncId] || null;
+      const L = localBySyncId.get(syncId) || null;
+      const R = remoteBySyncId.get(syncId) || null;
+      const localTomb = locallyClosedSinceBase.get(syncId) || null;
+      const remoteTomb = cloud.tombstones?.[syncId] || null;
 
-          // Find rightmost tab of the same group to place new tab on the right ("справа")
-          const groupSiblings = localRecords.filter(
-            r => String(r.g || "").trim().toLowerCase() === targetGroupTitle.toLowerCase()
-          );
-          let createProps = {
-            url: rem.u,
-            active: false,
-            pinned: Boolean(rem.p),
-            windowId: targetWinId
-          };
-
-          if (groupSiblings.length > 0 && !rem.p) {
-            const lastSibling = groupSiblings[groupSiblings.length - 1];
-            const sibTab = local.allTabs.find(t => t.id === lastSibling.localTabId);
-            if (sibTab) {
-              createProps.windowId = sibTab.windowId;
-              createProps.index = sibTab.index + 1;
-            }
-          }
-
-          const newTab = await browser.tabs.create(createProps);
-          createdTabId = newTab.id;
-          suppressedTabIds.add(createdTabId);
-
-          if (targetGroupTitle) {
-            tabCohortGroupCache.set(createdTabId, targetGroupTitle);
-            await browser.sessions
-              .setTabValue(createdTabId, SESSION_COHORT_GROUP_KEY, targetGroupTitle)
-              .catch(() => {});
-          }
-
-          if (targetStgGroupId && getFxBridge()) {
-            await getFxBridge().moveMirroredTabToStgGroup(createdTabId, targetStgGroupId);
-          } else if (targetGroupTitle && !rem.p) {
-            // Check if sibling tabs of this group are hidden or window is on a different group
-            const siblingsHidden =
-              groupSiblings.length > 0 && groupSiblings.every(s => s.localHidden);
-            const activeWinGroup = stgState.windowGroupsMap[newTab.windowId];
-            const winOnDifferentGroup =
-              activeWinGroup &&
-              String(activeWinGroup).toLowerCase() !== String(targetStgGroupId || targetGroupTitle).toLowerCase();
-
-            if (siblingsHidden || winOnDifferentGroup) {
-              await browser.tabs.hide([createdTabId]).catch(() => {});
-            }
-          }
+      // 1. Both L and R are absent
+      if (!L && !R) {
+        delete nextBaseMap[syncId];
+        if (localTomb) {
+          mergedTombstones[syncId] = localTomb;
+          locallyClosedSinceBase.delete(syncId);
         }
+        continue;
+      }
 
+      // 2. Added only on REMOTE (!B && !L && R)
+      if (!B && !L && R) {
+        // Check if we closed it locally very recently
+        if (localTomb && (localTomb.ts || 0) > (R.ts || 0)) {
+          mergedTombstones[syncId] = localTomb;
+          locallyClosedSinceBase.delete(syncId);
+          hasLocalDirtyToPush = true;
+          diffDeleted++;
+          continue;
+        }
+        const createdTabId = await createTabInBackgroundFromRecord(R, localContext);
         if (createdTabId) {
-          await setTabSyncId(createdTabId, rem.id);
-          localTabTimestamps.set(rem.id, rem.ts || Date.now());
-          knownTabSnapshot.set(createdTabId, {
-            syncTabId: rem.id,
-            url: normalizeUrl(rem.u),
-            title: rem.t || "",
-            stgGroupTitle: targetGroupTitle,
-            nativeGroupTitle: rem.ng || "",
-            indexInGroup: rem.i || 0
+          appliedRemoteChanges++;
+          diffAdded++;
+        }
+        const wireR = toWireRecord(R);
+        nextBaseMap[syncId] = wireR;
+        mergedRecordsMap.set(syncId, wireR);
+        continue;
+      }
+
+      // 3. Added only on LOCAL (!B && L && !R)
+      if (!B && L && !R) {
+        // Check if remote tombstoned this exact syncId after our local creation
+        if (currentSettings.syncCloseTabs && remoteTomb && (remoteTomb.ts || 0) >= (L.ts || 0)) {
+          await closeLocalTabForSync(L.localTabId, syncId);
+          delete nextBaseMap[syncId];
+          appliedRemoteChanges++;
+          diffDeleted++;
+          continue;
+        }
+        const wireL = toWireRecord(L);
+        nextBaseMap[syncId] = wireL;
+        mergedRecordsMap.set(syncId, wireL);
+        hasLocalDirtyToPush = true;
+        diffAdded++;
+        continue;
+      }
+
+      // 4. Existed in BASE (B != null), deleted on REMOTE (!R), still exists on LOCAL (L)
+      if (B && L && !R) {
+        const localModifiedSinceBase = !isRecordEqualToBase(L, B);
+        if (!localModifiedSinceBase) {
+          // Clean Fast-Forward Delete from Remote!
+          if (currentSettings.syncCloseTabs) {
+            await closeLocalTabForSync(L.localTabId, syncId);
+            delete nextBaseMap[syncId];
+            appliedRemoteChanges++;
+            diffDeleted++;
+          } else {
+            mergedRecordsMap.set(syncId, toWireRecord(L));
+          }
+        } else {
+          // CONFLICT: Modified locally on this PC, but closed (deleted) on the other PC!
+          activeConflicts[syncId] = {
+            id: syncId,
+            type: "modify-local-delete-remote",
+            detectedAt: Date.now(),
+            base: toWireRecord(B),
+            local: toWireRecord(L),
+            remote: null,
+            remoteDeviceName: cloud.meta.updatedByName || "Другой Firefox"
+          };
+          mergedRecordsMap.set(syncId, toWireRecord(L));
+        }
+        continue;
+      }
+
+      // 5. Existed in BASE (B != null), deleted on LOCAL (!L), still exists on REMOTE (R)
+      if (B && !L && R) {
+        const remoteModifiedSinceBase = !isRecordEqualToBase(R, B);
+        if (!remoteModifiedSinceBase) {
+          // Clean Fast-Forward Delete from Local! Push tombstone to cloud.
+          if (currentSettings.syncCloseTabs) {
+            mergedTombstones[syncId] = localTomb || {
+              ts: Date.now(),
+              by: deviceId,
+              u: B.u,
+              g: B.g
+            };
+            locallyClosedSinceBase.delete(syncId);
+            delete nextBaseMap[syncId];
+            hasLocalDirtyToPush = true;
+            diffDeleted++;
+          }
+        } else {
+          // CONFLICT: Closed (deleted) locally on this PC, but modified on the other PC!
+          activeConflicts[syncId] = {
+            id: syncId,
+            type: "delete-local-modify-remote",
+            detectedAt: Date.now(),
+            base: toWireRecord(B),
+            local: null,
+            remote: toWireRecord(R),
+            remoteDeviceName: cloud.meta.updatedByName || "Другой Firefox"
+          };
+          // Keep R in cloud records until user resolves conflict
+          mergedRecordsMap.set(syncId, toWireRecord(R));
+        }
+        continue;
+      }
+
+      // 6. Both L and R exist! Perform 3-way property comparison against B (or between L and R if !B)
+      if (L && R) {
+        const effectiveB = B || toWireRecord(R);
+        const localSameAsRemote = isRecordEqualToBase(L, R);
+
+        if (localSameAsRemote) {
+          // Both match! Advance BASE
+          const wire = toWireRecord({ ...L, i: R.i ?? L.i });
+          nextBaseMap[syncId] = wire;
+          mergedRecordsMap.set(syncId, wire);
+          continue;
+        }
+
+        const localChanged = !isRecordEqualToBase(L, effectiveB);
+        const remoteChanged = !isRecordEqualToBase(R, effectiveB);
+
+        if (!localChanged && remoteChanged) {
+          // Clean Fast-Forward Pull from Remote!
+          const changed = await applyRecordUpdateToLocalTab(L, R);
+          if (changed) {
+            appliedRemoteChanges++;
+            diffModified++;
+          }
+          const wireR = toWireRecord(R);
+          nextBaseMap[syncId] = wireR;
+          mergedRecordsMap.set(syncId, wireR);
+          continue;
+        }
+
+        if (localChanged && !remoteChanged) {
+          // Clean Fast-Forward Push from Local!
+          const wireL = toWireRecord(L);
+          nextBaseMap[syncId] = wireL;
+          mergedRecordsMap.set(syncId, wireL);
+          hasLocalDirtyToPush = true;
+          diffModified++;
+          continue;
+        }
+
+        // Both LOCAL and REMOTE changed since BASE!
+        // Check if we can field-level auto-merge (e.g. Local changed URL, Remote changed STG Group)
+        const urlChangedL = !isSameUrl(L.u, effectiveB.u);
+        const urlChangedR = !isSameUrl(R.u, effectiveB.u);
+        const urlConflict = urlChangedL && urlChangedR && !isSameUrl(L.u, R.u);
+
+        const groupChangedL = !isSameGroup(L.g, effectiveB.g);
+        const groupChangedR = !isSameGroup(R.g, effectiveB.g);
+        const groupConflict = groupChangedL && groupChangedR && !isSameGroup(L.g, R.g);
+
+        if (!urlConflict && !groupConflict) {
+          // Clean Field-Level Auto-Merge!
+          const mergedRecord = toWireRecord({
+            ...L,
+            u: urlChangedR ? R.u : L.u,
+            t: urlChangedR ? R.t : L.t,
+            g: groupChangedR ? R.g : L.g,
+            ng: !isSameNativeGroup(R.ng, effectiveB.ng) ? R.ng : L.ng,
+            nc: !isSameNativeGroup(R.ng, effectiveB.ng) ? R.nc : L.nc,
+            ts: Date.now(),
+            by: deviceId
           });
-
-          if (rem.ng) {
-            await ensureNativeTabGroupOnTab(createdTabId, null, rem.ng, rem.nc);
-          }
-
-          setTimeout(() => suppressedTabIds.delete(createdTabId), 800);
-          changesApplied++;
+          await applyRecordUpdateToLocalTab(L, mergedRecord);
+          nextBaseMap[syncId] = mergedRecord;
+          mergedRecordsMap.set(syncId, mergedRecord);
+          appliedRemoteChanges++;
+          hasLocalDirtyToPush = true;
+          diffModified++;
+        } else {
+          // True Git Merge Conflict on the same field (URL or Group)!
+          activeConflicts[syncId] = {
+            id: syncId,
+            type: urlConflict && groupConflict
+              ? "modify-both-url-and-group"
+              : urlConflict
+                ? "modify-modify-url"
+                : "modify-modify-group",
+            detectedAt: Date.now(),
+            base: toWireRecord(effectiveB),
+            local: toWireRecord(L),
+            remote: toWireRecord(R),
+            remoteDeviceName: cloud.meta.updatedByName || "Другой Firefox"
+          };
+          mergedRecordsMap.set(syncId, toWireRecord(L));
         }
+      }
+    }
+
+    // Order merged records by group and index
+    const mergedRecordsList = Array.from(mergedRecordsMap.values()).sort(
+      (a, b) => normalizeGroup(a.g).localeCompare(normalizeGroup(b.g)) || (a.i || 0) - (b.i || 0)
+    );
+
+    const conflictCount = Object.keys(activeConflicts).length;
+
+    // If we have local changes (or auto-merged changes) and no unresolved conflicts blocking a clean commit, push new commit
+    if (allowPush && hasLocalDirtyToPush && conflictCount === 0) {
+      const parentCommitId = cloud.meta.commitId || baseCommit.commitId || "root";
+      const statsObj = {
+        added: diffAdded,
+        modified: diffModified,
+        deleted: diffDeleted,
+        total: mergedRecordsList.length
+      };
+      const commitMsg =
+        appliedRemoteChanges > 0
+          ? `Auto-merge ${shortCommitHash(parentCommitId)} (+${diffAdded} ~${diffModified} -${diffDeleted})`
+          : `${reason} (+${diffAdded} ~${diffModified} -${diffDeleted})`;
+
+      const commitRes = await writeCloudCommit(mergedRecordsList, mergedTombstones, {
+        parentId: parentCommitId,
+        message: commitMsg,
+        stats: statsObj
+      });
+
+      baseCommit = {
+        commitId: commitRes.commitId,
+        parentId: commitRes.parentId,
+        timestamp: commitRes.timestamp,
+        recordsMap: nextBaseMap
+      };
+
+      await appendCommitToLog({
+        commitId: commitRes.commitId,
+        parentId: commitRes.parentId,
+        timestamp: commitRes.timestamp,
+        authorId: deviceId,
+        authorName: deviceName,
+        message: commitRes.message,
+        stats: statsObj,
+        records: commitRes.wireRecords
+      });
+
+      syncStats.lastDiffStats = statsObj;
+      syncStats.lastActionText = `Коммит ${shortCommitHash(commitRes.commitId)}: ${commitMsg}`;
+    } else {
+      // Fast-forward BASE to cloud commit if no conflicts
+      if (conflictCount === 0 && cloud.meta.commitId) {
+        baseCommit = {
+          commitId: cloud.meta.commitId,
+          parentId: cloud.meta.parentId || "",
+          timestamp: cloud.meta.updatedAt || Date.now(),
+          recordsMap: nextBaseMap
+        };
       } else {
-        // EXISTING MIRRORED TAB -> Check if remote record is newer
-        const remTs = Number(rem.ts) || 0;
-        const locTs = Number(loc.ts) || 0;
+        baseCommit.recordsMap = nextBaseMap;
+      }
+      await saveGitLocalState();
 
-        if (rem.by !== deviceId && remTs > locTs) {
-          const targetGroupTitle = String(rem.g || "").trim();
-
-          // 2a. Check URL update
-          if (
-            currentSettings.syncUrlChanges &&
-            normalizeUrl(rem.u) !== normalizeUrl(loc.u) &&
-            !loc.localActive
-          ) {
-            suppressedTabIds.add(loc.localTabId);
-            try {
-              await browser.tabs.update(loc.localTabId, { url: rem.u });
-              changesApplied++;
-            } catch (_) {
-            } finally {
-              setTimeout(() => suppressedTabIds.delete(loc.localTabId), 600);
-            }
-          }
-
-          // 2b. Check STG group move
-          if (
-            currentSettings.syncMoveGroups &&
-            targetGroupTitle &&
-            targetGroupTitle.toLowerCase() !== String(loc.g || "").trim().toLowerCase() &&
-            getFxBridge()
-          ) {
-            const ens = await getFxBridge().ensureStgGroup(targetGroupTitle);
-            if (ens && ens.ok && ens.group && ens.group.id) {
-              suppressedTabIds.add(loc.localTabId);
-              try {
-                await getFxBridge().moveMirroredTabToStgGroup(
-                  loc.localTabId,
-                  Number(ens.group.id)
-                );
-                changesApplied++;
-              } finally {
-                setTimeout(() => suppressedTabIds.delete(loc.localTabId), 600);
-              }
-            }
-          }
-
-          // 2c. Check Native Firefox Tab Group move
-          if (currentSettings.syncMoveGroups && String(rem.ng || "") !== String(loc.ng || "")) {
-            await ensureNativeTabGroupOnTab(loc.localTabId, loc.localWindowId, rem.ng, rem.nc);
-            changesApplied++;
-          }
-
-          localTabTimestamps.set(rem.id, remTs);
-        }
+      if (conflictCount > 0) {
+        syncStats.lastActionText = `⚡ Конфликт слияния (${conflictCount} вкл.) — выберите решение`;
+      } else if (appliedRemoteChanges > 0) {
+        syncStats.lastDiffStats = { added: diffAdded, modified: diffModified, deleted: diffDeleted };
+        syncStats.lastActionText = `Fast-forward ${shortCommitHash(baseCommit.commitId)}: принято ${appliedRemoteChanges} изм.`;
+      } else {
+        syncStats.lastActionText = `HEAD ${shortCommitHash(baseCommit.commitId)} актуален (${mergedRecordsList.length} вкл.)`;
       }
     }
 
     syncStats.lastPullTime = Date.now();
-    syncStats.totalSyncedTabs = Math.max(cloud.records.length, localRecords.length);
-    if (changesApplied > 0) {
-      syncStats.lastActionText = `Принято изменений из Firefox Sync: ${changesApplied}`;
-    } else {
-      syncStats.lastActionText = `Зеркало актуально (${syncStats.totalSyncedTabs} вкл.)`;
-    }
+    syncStats.totalSyncedTabs = mergedRecordsList.length;
     syncStats.lastError = null;
     await updateBadge();
-
-    // If allowPushMerged is true (e.g. initial startup or enabling mirror mode) and we have local tabs not in remoteSyncIds, push merged state
-    if (allowPushMerged) {
-      const hasUnpushedLocal = localRecords.some(r => !remoteSyncIds.has(r.id));
-      if (hasUnpushedLocal || changesApplied > 0) {
-        setTimeout(() => pushLocalChangesToCloud("Слияние при старте"), 600);
-      }
-    }
   } catch (err) {
-    console.error("[STG Mirror Sync] reconcileFromCloud error:", err);
+    console.error("[STG Mirror Sync] runGitThreeWaySync error:", err);
     syncStats.lastError = String(err && err.message ? err.message : err);
     await updateBadge();
   } finally {
-    isReconciling = false;
+    isSyncingGit = false;
+  }
+}
+
+// === Conflict Resolution (git mergetool: ours / theirs / both) ===
+
+async function resolveSingleConflict(syncId, strategy) {
+  const conflict = activeConflicts[syncId];
+  if (!conflict) {
+    return { ok: false, error: "Conflict not found" };
+  }
+
+  const [cloud, localContext] = await Promise.all([
+    readCloudState(),
+    collectLocalState()
+  ]);
+
+  const locTab = localContext.localRecords.find(r => r.id === syncId) || null;
+  const remRec = conflict.remote;
+  const locRec = conflict.local;
+
+  if (strategy === "ours") {
+    // Keep local version (if local was deleted, ensure it's tombstoned; if local exists, update base to local)
+    if (!locRec) {
+      if (locTab) {
+        await closeLocalTabForSync(locTab.localTabId, syncId);
+      }
+      locallyClosedSinceBase.set(syncId, {
+        ts: Date.now(),
+        by: deviceId,
+        u: conflict.base?.u || remRec?.u || "",
+        g: conflict.base?.g || remRec?.g || ""
+      });
+      delete baseCommit.recordsMap[syncId];
+    } else {
+      const updatedWire = toWireRecord({ ...locRec, ts: Date.now(), by: deviceId });
+      baseCommit.recordsMap[syncId] = updatedWire;
+      localTabTimestamps.set(syncId, updatedWire.ts);
+    }
+  } else if (strategy === "theirs") {
+    // Accept remote version (if remote deleted it, close local tab; if remote modified/exists, apply remote in background)
+    if (!remRec) {
+      if (locTab) {
+        await closeLocalTabForSync(locTab.localTabId, syncId);
+      }
+      delete baseCommit.recordsMap[syncId];
+    } else {
+      if (locTab) {
+        await applyRecordUpdateToLocalTab(locTab, remRec);
+      } else {
+        await createTabInBackgroundFromRecord(remRec, localContext);
+      }
+      const updatedWire = toWireRecord({ ...remRec, ts: Date.now() });
+      baseCommit.recordsMap[syncId] = updatedWire;
+      localTabTimestamps.set(syncId, updatedWire.ts);
+    }
+  } else if (strategy === "both") {
+    // Keep both versions without losing anything!
+    // Local stays as syncId (or is recreated if local was deleted), and Remote is forked as a new tab in background if both exist
+    if (locRec && remRec) {
+      const updatedLocalWire = toWireRecord({ ...locRec, ts: Date.now(), by: deviceId });
+      baseCommit.recordsMap[syncId] = updatedLocalWire;
+
+      // Create forked copy for the remote version with a new syncTabId in background
+      const forkedId = generateSyncId();
+      const forkedRecord = toWireRecord({
+        ...remRec,
+        id: forkedId,
+        ts: Date.now(),
+        by: deviceId
+      });
+      await createTabInBackgroundFromRecord(forkedRecord, localContext);
+      baseCommit.recordsMap[forkedId] = forkedRecord;
+    } else if (!locRec && remRec) {
+      // Local had deleted it, remote modified it -> restore remote tab in background
+      await createTabInBackgroundFromRecord(remRec, localContext);
+      baseCommit.recordsMap[syncId] = toWireRecord({ ...remRec, ts: Date.now(), by: deviceId });
+    } else if (locRec && !remRec) {
+      // Remote had deleted it, local modified it -> keep local tab alive
+      baseCommit.recordsMap[syncId] = toWireRecord({ ...locRec, ts: Date.now(), by: deviceId });
+    }
+  }
+
+  delete activeConflicts[syncId];
+  await saveGitLocalState();
+  await updateBadge();
+
+  // If all conflicts are now resolved, commit the merge result to the cloud
+  if (Object.keys(activeConflicts).length === 0) {
+    const freshLocal = await collectLocalState();
+    const mergedTombstones = { ...(cloud.tombstones || {}) };
+    for (const [closedId, tomb] of locallyClosedSinceBase.entries()) {
+      mergedTombstones[closedId] = tomb;
+    }
+    locallyClosedSinceBase.clear();
+
+    // Remove tombstones for tabs that were kept alive
+    for (const r of freshLocal.localRecords) {
+      delete mergedTombstones[r.id];
+    }
+
+    const commitRes = await writeCloudCommit(freshLocal.localRecords, mergedTombstones, {
+      parentId: cloud.meta?.commitId || baseCommit.commitId || "root",
+      message: `Merge conflict resolved (${strategy})`,
+      stats: {
+        added: 0,
+        modified: 1,
+        deleted: 0,
+        total: freshLocal.localRecords.length
+      }
+    });
+
+    baseCommit = {
+      commitId: commitRes.commitId,
+      parentId: commitRes.parentId,
+      timestamp: commitRes.timestamp,
+      recordsMap: recordsMapFromArray(commitRes.wireRecords)
+    };
+
+    await appendCommitToLog({
+      commitId: commitRes.commitId,
+      parentId: commitRes.parentId,
+      timestamp: commitRes.timestamp,
+      authorId: deviceId,
+      authorName: deviceName,
+      message: commitRes.message,
+      stats: commitRes.stats,
+      records: commitRes.wireRecords
+    });
+
+    syncStats.lastActionText = `Конфликты решены → ${shortCommitHash(commitRes.commitId)}`;
+    await updateBadge();
+  }
+
+  return { ok: true };
+}
+
+async function resolveAllConflicts(strategy) {
+  const ids = Object.keys(activeConflicts);
+  for (const id of ids) {
+    await resolveSingleConflict(id, strategy);
+  }
+  return { ok: true, resolvedCount: ids.length };
+}
+
+// === Git Rollback (git reset --hard <commitId>) ===
+
+async function rollbackToCommit(targetCommitId) {
+  const targetCommit = commitLog.find(c => c.commitId === targetCommitId);
+  if (!targetCommit || !Array.isArray(targetCommit.records)) {
+    return { ok: false, error: "Коммит не найден в локальной истории" };
+  }
+
+  isSyncingGit = true;
+  try {
+    const [cloud, localContext] = await Promise.all([
+      readCloudState(),
+      collectLocalState()
+    ]);
+
+    const targetBySyncId = new Map();
+    for (const r of targetCommit.records) {
+      if (r && r.id) {
+        targetBySyncId.set(r.id, r);
+      }
+    }
+
+    const localBySyncId = new Map();
+    for (const r of localContext.localRecords) {
+      localBySyncId.set(r.id, r);
+    }
+
+    const mergedTombstones = { ...(cloud.tombstones || {}) };
+    const now = Date.now();
+
+    // 1. Close local tabs that are not in the target commit (keep at least 1 tab open so window doesn't close)
+    const tabsToClose = localContext.localRecords.filter(r => !targetBySyncId.has(r.id));
+    if (tabsToClose.length > 0 && targetBySyncId.size > 0) {
+      for (const extra of tabsToClose) {
+        mergedTombstones[extra.id] = {
+          ts: now,
+          by: deviceId,
+          u: extra.u,
+          g: extra.g
+        };
+        await closeLocalTabForSync(extra.localTabId, extra.id);
+      }
+    }
+
+    // 2. Restore or update all tabs from targetCommit.records in background
+    for (const targetRec of targetCommit.records) {
+      delete mergedTombstones[targetRec.id];
+      const existingLoc = localBySyncId.get(targetRec.id);
+      if (existingLoc) {
+        await applyRecordUpdateToLocalTab(existingLoc, targetRec);
+      } else {
+        await createTabInBackgroundFromRecord(targetRec, localContext);
+      }
+    }
+
+    activeConflicts = {};
+    locallyClosedSinceBase.clear();
+
+    const restoredRecords = targetCommit.records.map(r => toWireRecord(r, now));
+    const commitRes = await writeCloudCommit(restoredRecords, mergedTombstones, {
+      parentId: cloud.meta?.commitId || baseCommit.commitId || "root",
+      message: `Reset to ${shortCommitHash(targetCommitId)} (${restoredRecords.length} вкл.)`,
+      stats: {
+        added: 0,
+        modified: restoredRecords.length,
+        deleted: tabsToClose.length,
+        total: restoredRecords.length
+      }
+    });
+
+    baseCommit = {
+      commitId: commitRes.commitId,
+      parentId: commitRes.parentId,
+      timestamp: commitRes.timestamp,
+      recordsMap: recordsMapFromArray(commitRes.wireRecords)
+    };
+
+    await appendCommitToLog({
+      commitId: commitRes.commitId,
+      parentId: commitRes.parentId,
+      timestamp: commitRes.timestamp,
+      authorId: deviceId,
+      authorName: deviceName,
+      message: commitRes.message,
+      stats: commitRes.stats,
+      records: commitRes.wireRecords
+    });
+
+    syncStats.lastActionText = `Откат к ${shortCommitHash(targetCommitId)} → ${shortCommitHash(commitRes.commitId)}`;
+    syncStats.lastError = null;
+    await updateBadge();
+
+    return { ok: true, newCommitId: commitRes.commitId };
+  } catch (err) {
+    console.error("[STG Mirror Sync] rollbackToCommit error:", err);
+    return { ok: false, error: String(err && err.message ? err.message : err) };
+  } finally {
+    isSyncingGit = false;
   }
 }
 
@@ -877,7 +1530,7 @@ function restartBackgroundPollTimer() {
   }
   const sec = Math.max(4, Number(currentSettings.pollIntervalSec) || 8);
   pollIntervalHandle = setInterval(async () => {
-    if (!currentSettings.mirrorEnabled || isReconciling || isPushing) {
+    if (!currentSettings.mirrorEnabled || isSyncingGit) {
       return;
     }
     try {
@@ -887,7 +1540,7 @@ function restartBackgroundPollTimer() {
           syncStats.lastWeaveSyncTime = Date.now();
         }
       }
-      await reconcileFromCloud(false);
+      await runGitThreeWaySync({ reason: "Фоновая синхронизация", allowPush: true });
     } catch (e) {
       console.warn("[STG Mirror Sync] Background poll warning:", e);
     }
@@ -900,10 +1553,9 @@ browser.tabs.onCreated.addListener(tab => {
   if (!currentSettings.mirrorEnabled || suppressedTabIds.has(tab.id) || tab.incognito) {
     return;
   }
-  // Wait briefly for STG to assign its groupId and initial URL to settle
   setTimeout(() => {
     if (!suppressedTabIds.has(tab.id)) {
-      schedulePushLocalChanges("Открыта новая вкладка", 500);
+      scheduleGitSync("Открыта вкладка", 500);
     }
   }, 350);
 });
@@ -913,23 +1565,27 @@ browser.tabs.onUpdated.addListener(
     if (!currentSettings.mirrorEnabled || suppressedTabIds.has(tabId) || tab.incognito) {
       return;
     }
-    if (changeInfo.status === "complete" || changeInfo.url || "pinned" in changeInfo || "groupId" in changeInfo || "hidden" in changeInfo) {
-      schedulePushLocalChanges("Обновлена вкладка", 500);
+    if (
+      changeInfo.status === "complete" ||
+      changeInfo.url ||
+      "pinned" in changeInfo ||
+      "groupId" in changeInfo ||
+      "hidden" in changeInfo
+    ) {
+      scheduleGitSync("Обновлена вкладка", 500);
     }
   },
   { properties: ["status", "url", "pinned", "groupId", "hidden"] }
 );
 
-browser.tabs.onMoved.addListener((tabId, moveInfo) => {
+browser.tabs.onMoved.addListener(tabId => {
   if (!currentSettings.mirrorEnabled || suppressedTabIds.has(tabId)) {
     return;
   }
-  schedulePushLocalChanges("Перемещена вкладка", 600);
+  scheduleGitSync("Перемещена вкладка", 600);
 });
 
 browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  // IMPORTANT: Ignore tab removals when an entire browser window is closing (e.g. exiting Firefox)
-  // so shutting down PC 1 never wipes out tabs on PC 2!
   if (removeInfo && removeInfo.isWindowClosing) {
     return;
   }
@@ -945,22 +1601,23 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (syncId) {
     syncIdToTabId.delete(syncId);
     if (currentSettings.syncCloseTabs) {
-      pendingTombstones.set(syncId, {
+      locallyClosedSinceBase.set(syncId, {
         ts: Date.now(),
         by: deviceId,
         u: snap?.url || "",
-        g: snap?.stgGroupTitle || ""
+        g: snap?.stgGroupTitle || "",
+        t: snap?.title || ""
       });
     }
   }
 
-  schedulePushLocalChanges("Закрыта вкладка", 450);
+  scheduleGitSync("Закрыта вкладка", 450);
 });
 
 if (browser.tabGroups) {
   browser.tabGroups.onUpdated.addListener(() => {
-    if (currentSettings.mirrorEnabled && !isReconciling) {
-      schedulePushLocalChanges("Обновлена нативная группа", 600);
+    if (currentSettings.mirrorEnabled && !isSyncingGit) {
+      scheduleGitSync("Обновлена нативная группа", 600);
     }
   });
 }
@@ -969,9 +1626,8 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (area === "sync") {
     if (changes[META_KEY]) {
       const newMeta = changes[META_KEY].newValue;
-      // If the change came from another device, reconcile immediately!
       if (newMeta && newMeta.updatedBy && newMeta.updatedBy !== deviceId) {
-        reconcileFromCloud(false);
+        runGitThreeWaySync({ reason: "Входящий коммит из Firefox Sync", allowPush: true });
       }
     }
   }
@@ -993,7 +1649,16 @@ browser.runtime.onMessage.addListener(msg => {
         deviceId,
         deviceName,
         syncAccountInfo,
-        stats: syncStats
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts),
+        commitLog: commitLog.slice(0, 15).map(c => ({
+          commitId: c.commitId,
+          parentId: c.parentId,
+          timestamp: c.timestamp,
+          authorName: c.authorName,
+          message: c.message,
+          stats: c.stats
+        }))
       };
     })();
   }
@@ -1010,11 +1675,12 @@ browser.runtime.onMessage.addListener(msg => {
         if (getFxBridge()) {
           await getFxBridge().triggerFirefoxSync().catch(() => {});
         }
-        await reconcileFromCloud(true);
+        await runGitThreeWaySync({ reason: "Включён режим зеркала", allowPush: true });
       }
       return {
         settings: currentSettings,
-        stats: syncStats
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts)
       };
     })();
   }
@@ -1027,23 +1693,87 @@ browser.runtime.onMessage.addListener(msg => {
           syncStats.lastWeaveSyncTime = Date.now();
         }
       }
-      await reconcileFromCloud(true);
+      await runGitThreeWaySync({ reason: "Ручной git sync (pull + merge + push)", allowPush: true });
       return {
         settings: currentSettings,
-        stats: syncStats
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts),
+        commitLog: commitLog.slice(0, 15)
+      };
+    })();
+  }
+
+  if (msg.action === "resolveConflict") {
+    return (async () => {
+      await resolveSingleConflict(msg.syncId, msg.strategy);
+      return {
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts),
+        commitLog: commitLog.slice(0, 15)
+      };
+    })();
+  }
+
+  if (msg.action === "resolveAllConflicts") {
+    return (async () => {
+      await resolveAllConflicts(msg.strategy);
+      return {
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts),
+        commitLog: commitLog.slice(0, 15)
+      };
+    })();
+  }
+
+  if (msg.action === "rollbackToCommit") {
+    return (async () => {
+      const res = await rollbackToCommit(msg.commitId);
+      return {
+        ...res,
+        stats: syncStats,
+        conflicts: Object.values(activeConflicts),
+        commitLog: commitLog.slice(0, 15)
       };
     })();
   }
 
   if (msg.action === "forcePushAll") {
     return (async () => {
-      await pushLocalChangesToCloud("Принудительная отправка всех вкладок", true);
-      if (getFxBridge()) {
-        await getFxBridge().triggerFirefoxSync().catch(() => {});
-      }
+      const [cloud, local] = await Promise.all([readCloudState(), collectLocalState()]);
+      activeConflicts = {};
+      locallyClosedSinceBase.clear();
+      const commitRes = await writeCloudCommit(local.localRecords, cloud.tombstones || {}, {
+        parentId: cloud.meta?.commitId || baseCommit.commitId || "root",
+        message: `Force push --ours (${local.localRecords.length} вкл.)`,
+        stats: {
+          added: 0,
+          modified: local.localRecords.length,
+          deleted: 0,
+          total: local.localRecords.length
+        }
+      });
+      baseCommit = {
+        commitId: commitRes.commitId,
+        parentId: commitRes.parentId,
+        timestamp: commitRes.timestamp,
+        recordsMap: recordsMapFromArray(commitRes.wireRecords)
+      };
+      await appendCommitToLog({
+        commitId: commitRes.commitId,
+        parentId: commitRes.parentId,
+        timestamp: commitRes.timestamp,
+        authorId: deviceId,
+        authorName: deviceName,
+        message: commitRes.message,
+        stats: commitRes.stats,
+        records: commitRes.wireRecords
+      });
+      await updateBadge();
       return {
         settings: currentSettings,
-        stats: syncStats
+        stats: syncStats,
+        conflicts: [],
+        commitLog: commitLog.slice(0, 15)
       };
     })();
   }
@@ -1053,10 +1783,36 @@ browser.runtime.onMessage.addListener(msg => {
       if (getFxBridge()) {
         await getFxBridge().triggerFirefoxSync().catch(() => {});
       }
-      await reconcileFromCloud(false);
+      // Reset base to empty and accept all remote
+      const cloud = await readCloudState();
+      if (cloud.meta && cloud.records.length > 0) {
+        activeConflicts = {};
+        locallyClosedSinceBase.clear();
+        const local = await collectLocalState();
+        const localById = new Map(local.localRecords.map(r => [r.id, r]));
+        for (const rem of cloud.records) {
+          const ex = localById.get(rem.id);
+          if (ex) {
+            await applyRecordUpdateToLocalTab(ex, rem);
+          } else {
+            await createTabInBackgroundFromRecord(rem, local);
+          }
+        }
+        baseCommit = {
+          commitId: cloud.meta.commitId || generateCommitId(cloud.records, "root"),
+          parentId: cloud.meta.parentId || "root",
+          timestamp: cloud.meta.updatedAt || Date.now(),
+          recordsMap: recordsMapFromArray(cloud.records)
+        };
+        await saveGitLocalState();
+        syncStats.lastActionText = `Принято состояние облака (--theirs): ${cloud.records.length} вкл.`;
+        await updateBadge();
+      }
       return {
         settings: currentSettings,
-        stats: syncStats
+        stats: syncStats,
+        conflicts: [],
+        commitLog: commitLog.slice(0, 15)
       };
     })();
   }
@@ -1066,8 +1822,28 @@ browser.runtime.onMessage.addListener(msg => {
 
 (async function init() {
   try {
-    const stored = await browser.storage.local.get(["settings", "deviceId", "deviceName"]);
+    const stored = await browser.storage.local.get([
+      "settings",
+      "deviceId",
+      "deviceName",
+      GIT_BASE_KEY,
+      GIT_LOG_KEY,
+      GIT_CONFLICTS_KEY
+    ]);
     currentSettings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+
+    if (stored[GIT_BASE_KEY] && typeof stored[GIT_BASE_KEY] === "object") {
+      baseCommit = stored[GIT_BASE_KEY];
+      syncStats.headCommitId = baseCommit.commitId || "";
+      syncStats.parentCommitId = baseCommit.parentId || "";
+    }
+    if (Array.isArray(stored[GIT_LOG_KEY])) {
+      commitLog = stored[GIT_LOG_KEY];
+    }
+    if (stored[GIT_CONFLICTS_KEY] && typeof stored[GIT_CONFLICTS_KEY] === "object") {
+      activeConflicts = stored[GIT_CONFLICTS_KEY];
+      syncStats.conflictCount = Object.keys(activeConflicts).length;
+    }
 
     if (getFxBridge()) {
       syncAccountInfo = await getFxBridge().getSyncAccountInfo().catch(() => syncAccountInfo);
@@ -1088,13 +1864,12 @@ browser.runtime.onMessage.addListener(msg => {
     await updateBadge();
     restartBackgroundPollTimer();
 
-    // Give STG 1.5 seconds on browser startup to finish initializing its background cache, then run initial sync
     setTimeout(async () => {
       if (currentSettings.mirrorEnabled) {
         if (getFxBridge()) {
           await getFxBridge().triggerFirefoxSync().catch(() => {});
         }
-        await reconcileFromCloud(true);
+        await runGitThreeWaySync({ reason: "Авто-слияние при запуске", allowPush: true });
       }
     }, 1500);
   } catch (err) {

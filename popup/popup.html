@@ -2,97 +2,122 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>STG Firefox Sync Tab Mirror</title>
+  <title>STG Sync Tab Mirror (Git Merge)</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="header">
-    <div class="title-row">
-      <div class="logo-badge">SYNC</div>
-      <div>
-        <h1>Зеркало вкладок Firefox Sync</h1>
-        <p class="subtitle">Фоновая синхронизация STG и нативных групп</p>
+  <div class="container">
+    <header class="header">
+      <div class="title-row">
+        <img src="../icons/icon.svg" alt="Icon" class="logo">
+        <div>
+          <h1>STG Sync Tab Mirror</h1>
+          <div class="subtitle">
+            <span>Git 3-Way Merge • Фоновый режим</span>
+            <span id="headCommitBadge" class="commit-pill">#root</span>
+          </div>
+        </div>
       </div>
-    </div>
-    <label class="switch" title="Включить / выключить зеркальную синхронизацию">
-      <input type="checkbox" id="mirrorEnabled">
-      <span class="slider"></span>
-    </label>
-  </div>
+      <label class="switch" title="Включить / выключить зеркальную синхронизацию">
+        <input type="checkbox" id="mirrorEnabledToggle" checked>
+        <span class="slider"></span>
+      </label>
+    </header>
 
-  <div class="account-box" id="accountBox">
-    <div class="account-row">
-      <span class="account-label">Аккаунт Firefox Sync:</span>
-      <span class="account-val" id="fxAccountVal">Проверка...</span>
-    </div>
-    <div class="account-row">
-      <span class="account-label">Текущее устройство:</span>
-      <span class="account-val" id="deviceNameVal">—</span>
-    </div>
-  </div>
-
-  <div class="stats-grid">
-    <div class="stat-card">
-      <span class="stat-num" id="statTabsCount">0</span>
-      <span class="stat-label">Вкладок в зеркале</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-num" id="statGroupsCount">0</span>
-      <span class="stat-label">Групп STG</span>
-    </div>
-  </div>
-
-  <div class="status-line" id="statusLine">Загрузка состояния...</div>
-
-  <div class="section">
-    <h2>Параметры зеркалирования</h2>
-
-    <label class="option-row">
-      <input type="checkbox" id="syncCloseTabs">
-      <div>
-        <div class="option-title">Зеркалировать закрытие вкладок</div>
-        <div class="option-desc">Закрытие вкладки на одной машине закрывает её в фоне на других (закрытие всего окна браузера игнорируется)</div>
+    <!-- Панель разрешения конфликтов (Git Mergetool) — показывается при наличии конфликтов -->
+    <section id="conflictsCard" class="card conflict-card hidden">
+      <div class="conflict-header">
+        <span class="conflict-title">⚡ Конфликты слияния (<span id="conflictCountText">0</span>)</span>
+        <span class="conflict-hint">Авто-слияние этих вкладок приостановлено</span>
       </div>
-    </label>
-
-    <label class="option-row">
-      <input type="checkbox" id="syncUrlChanges">
-      <div>
-        <div class="option-title">Зеркалировать смену URL внутри вкладки</div>
-        <div class="option-desc">При переходе по ссылке обновляет URL соответствующей фоновой вкладки</div>
+      <div class="bulk-resolve-row">
+        <button id="resolveAllOursBtn" class="btn btn-xs btn-ours" title="git checkout --ours (оставить локальные версии)">
+          Все мои (--ours)
+        </button>
+        <button id="resolveAllTheirsBtn" class="btn btn-xs btn-theirs" title="git checkout --theirs (принять удалённые версии)">
+          Все удалённые (--theirs)
+        </button>
+        <button id="resolveAllBothBtn" class="btn btn-xs btn-both" title="Сохранить обе версии вкладок без потерь">
+          Обе версии (Keep Both)
+        </button>
       </div>
-    </label>
+      <div id="conflictsList" class="conflicts-list"></div>
+    </section>
 
-    <label class="option-row">
-      <input type="checkbox" id="syncMoveGroups">
-      <div>
-        <div class="option-title">Зеркалировать перемещение по группам</div>
-        <div class="option-desc">Синхронизирует перенос вкладок между группами STG и нативными группами Firefox</div>
+    <section class="card status-card">
+      <div class="status-row">
+        <span class="status-label">Аккаунт Firefox Sync:</span>
+        <span id="fxAccountVal" class="status-val">Проверка...</span>
       </div>
-    </label>
-
-    <label class="option-row">
-      <input type="checkbox" id="syncPinnedTabs">
-      <div>
-        <div class="option-title">Синхронизировать закреплённые вкладки</div>
-        <div class="option-desc">Включать закреплённые (pinned) вкладки в общее зеркало</div>
+      <div class="status-row">
+        <span class="status-label">Это устройство:</span>
+        <span id="deviceNameVal" class="status-val">—</span>
       </div>
-    </label>
+      <div class="status-row">
+        <span class="status-label">Вкладок / Групп STG:</span>
+        <span id="tabsGroupsVal" class="status-val">0 / 0</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">Последний коммит:</span>
+        <span id="lastActionVal" class="status-val highlight">—</span>
+      </div>
+    </section>
 
-    <div class="interval-row">
-      <span>Интервал фонового опроса Firefox Sync (сек):</span>
-      <input type="number" id="pollIntervalSec" min="4" max="120" step="1" value="8">
+    <section class="actions-grid">
+      <button id="syncNowBtn" class="btn btn-primary" title="Выполнить 3-стороннее слияние (git pull --rebase + merge + push)">
+        🔄 Git Sync (Merge + Push)
+      </button>
+      <div class="sub-actions">
+        <button id="forcePushBtn" class="btn btn-secondary" title="Принудительно перезаписать облако своими вкладками (git push --force)">
+          ⬆️ Push --ours
+        </button>
+        <button id="forcePullBtn" class="btn btn-secondary" title="Принудительно принять все вкладки из облака в фоне (git reset --theirs)">
+          ⬇️ Pull --theirs
+        </button>
+      </div>
+    </section>
+
+    <!-- Вкладки интерфейса: История коммитов (git log) / Настройки -->
+    <div class="tabs-nav">
+      <button id="tabBtnLog" class="tab-btn active">📜 История коммитов (git log)</button>
+      <button id="tabBtnSettings" class="tab-btn">⚙️ Настройки</button>
     </div>
-  </div>
 
-  <div class="actions">
-    <button id="btnSyncNow" class="btn primary">🔄 Синхронизировать сейчас</button>
-    <div class="actions-sub">
-      <button id="btnForcePush" class="btn secondary">⬆️ Отправить все</button>
-      <button id="btnForcePull" class="btn secondary">⬇️ Принять из облака</button>
-    </div>
-  </div>
+    <!-- Вкладка 1: История коммитов и откат (git log / git reset) -->
+    <section id="panelLog" class="card log-card">
+      <div id="commitLogList" class="commit-log-list">
+        <div class="empty-log">История коммитов пока пуста</div>
+      </div>
+    </section>
 
+    <!-- Вкладка 2: Настройки -->
+    <section id="panelSettings" class="card settings-card hidden">
+      <label class="checkbox-row">
+        <input type="checkbox" id="syncCloseTabs" checked>
+        <span>Зеркалировать закрытие вкладок</span>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="syncUrlChanges" checked>
+        <span>Зеркалировать переходы по URL внутри вкладок</span>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="syncMoveGroups" checked>
+        <span>Зеркалировать перемещение между группами STG и нативными группами</span>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="syncPinnedTabs" checked>
+        <span>Зеркалировать закреплённые (pinned) вкладки</span>
+      </label>
+      <div class="interval-row">
+        <span>Интервал фонового опроса Sync (сек.):</span>
+        <input type="number" id="pollIntervalSec" min="4" max="120" value="8">
+      </div>
+    </section>
+
+    <footer class="footer-note">
+      Новые и изменённые вкладки из неактивных групп создаются строго в фоне (<code>hidden: true</code>, <code>active: false</code>).
+    </footer>
+  </div>
   <script src="popup.js"></script>
 </body>
 </html>
